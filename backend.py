@@ -9,6 +9,9 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
+TZ_NAME = os.getenv("TZ") or "Asia/Ho_Chi_Minh"      # giờ hiển thị trong log (đổi bằng biến môi trường TZ)
+os.environ["TZ"] = TZ_NAME
+if hasattr(time, "tzset"): time.tzset()
 try:
     import resource            # chỉ có trên Linux/macOS: dùng để giới hạn RAM cho chương trình người dùng
 except ImportError:
@@ -90,6 +93,9 @@ SCHEMA = [
         auto_restart INTEGER NOT NULL DEFAULT 1, run_wanted INTEGER NOT NULL DEFAULT 0,
         env TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS idx_proj_user ON projects(user_id)",
+    """CREATE TABLE IF NOT EXISTS api_tokens(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, prefix TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created REAL NOT NULL, last_used REAL)""",
 ]
 
 def _connect():
@@ -177,6 +183,14 @@ def current_user():
     if uid:
         row = q1("SELECT * FROM users WHERE id=?", (uid,))
         if row and row["is_active"] and row["token_ver"] == session.get("tv"): u = row
+    if u is None:
+        ah = request.headers.get("Authorization", "")
+        if ah.startswith("Bearer ph_") and len(ah) < 120:
+            row = q1("SELECT u.*, t.id AS tid FROM api_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=?", (hashlib.sha256(ah[7:].strip().encode()).hexdigest(),))
+            if row and row["is_active"]:
+                u = row; g.via_token = True
+                try: ex("UPDATE api_tokens SET last_used=? WHERE id=?", (time.time(), row["tid"]))
+                except Exception: pass
     g.user = u
     return u
 
@@ -481,7 +495,7 @@ def build_env(p):
     """Môi trường sạch cho chương trình người dùng: KHÔNG chứa SECRET_KEY, mật khẩu admin hay key của máy chủ."""
     pid = p["id"]
     env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": wdir(pid), "LANG": "C.UTF-8",
-           "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONUNBUFFERED": "1", "TZ": TZ_NAME, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONPATH": libdir(pid)}
     env.update(user_env(p))
     return env
@@ -527,14 +541,29 @@ def _pump(pid, proc, kind):
     _on_exit(pid, proc, kind, code)
 
 def _on_exit(pid, proc, kind, code):
-    stopping = False
+    stopping, then_run = False, False
     with PLOCK:
         st = PROCS.get(pid)
         if st and st["proc"] is proc:
-            stopping = bool(st.get("stopping"))
+            stopping = bool(st.get("stopping")); then_run = bool(st.get("then_run"))
             PROCS.pop(pid, None)
     LAST[pid] = {"code": code, "ended": time.time(), "kind": kind, "stopped": stopping}
     plog(pid, ("■ Cài thư viện xong" if kind == "install" else "■ Chương trình đã dừng") + f" (mã thoát {code})" + (" — do bạn dừng" if stopping else ""))
+    if kind == "install":
+        try:
+            p = (raw_all("SELECT * FROM projects WHERE id=?", (pid,)) or [None])[0]
+            if p and code == 0 and not stopping:
+                os.makedirs(libdir(pid), exist_ok=True)
+                with open(os.path.join(libdir(pid), ".req_sig"), "w") as fh: fh.write(req_sig(p) or "")
+                if then_run:
+                    plog(pid, "✔ Đã cài xong thư viện, đang chạy chương trình…")
+                    start_process(p, "run")
+            elif p and then_run and not stopping:
+                plog(pid, "⚠ Cài thư viện bị lỗi nên chưa chạy chương trình. Sửa requirements.txt rồi bấm Chạy lại.")
+                raw_exec("UPDATE projects SET run_wanted=0 WHERE id=?", (pid,))
+        except Exception as exc:
+            plog(pid, "⚠ Lỗi sau khi cài thư viện: " + str(exc))
+        return
     if kind != "run" or stopping: return
     try:
         p = (raw_all("SELECT * FROM projects WHERE id=?", (pid,)) or [None])[0]
@@ -603,11 +632,26 @@ def resolve_python(ver, pid=None):
         PY_CACHE[ver] = exe
         return exe
 
-def start_process(p, kind="run"):
+def req_sig(p):
+    f = os.path.join(wdir(p["id"]), "requirements.txt")
+    if not os.path.isfile(f): return None
+    with open(f, "rb") as fh: return hashlib.sha1(fh.read() + b"|" + (p.get("py") or "").encode()).hexdigest()
+
+def need_install(p):
+    sig = req_sig(p)
+    if not sig: return False
+    try:
+        with open(os.path.join(libdir(p["id"]), ".req_sig")) as fh: return fh.read().strip() != sig
+    except OSError: return True
+
+def start_process(p, kind="run", then_run=False):
     pid, uid = p["id"], p["user_id"]
     wd = wdir(pid)
     os.makedirs(wd, exist_ok=True); os.makedirs(libdir(pid), exist_ok=True)
     owner = (raw_all("SELECT is_admin FROM users WHERE id=?", (uid,)) or [{"is_admin": 0}])[0]
+    if kind == "run" and need_install(p):
+        plog(pid, "📦 Có requirements.txt chưa cài, tự cài thư viện trước khi chạy…")
+        return start_process(p, "install", then_run=True)
     exe = resolve_python(p.get("py") or "", pid)
     with PLOCK:
         if pid in PROCS: raise ValueError("Dự án đang chạy hoặc đang cài thư viện.")
@@ -635,7 +679,7 @@ def start_process(p, kind="run"):
         plog(pid, "▶ " + shown)
         proc = subprocess.Popen(cmd, cwd=wd, env=build_env(p), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True, close_fds=True, preexec_fn=_limits_run if kind == "run" else _limits_install)
-        PROCS[pid] = {"proc": proc, "kind": kind, "started": time.time(), "uid": uid, "stopping": False}
+        PROCS[pid] = {"proc": proc, "kind": kind, "started": time.time(), "uid": uid, "stopping": False, "then_run": then_run}
     LAST.pop(pid, None)
     threading.Thread(target=_pump, args=(pid, proc, kind), daemon=True).start()
     if kind == "install":
@@ -894,6 +938,151 @@ def delete_file(pid):
     elif os.path.isfile(full): os.remove(full)
     else: return jsonify({"error": "Không có file này."}), 404
     return jsonify({"ok": True})
+
+# ------------------------------------------------------------------ API nâng cao
+from flask import Response, stream_with_context
+import codecs
+CPU_PREV = {}
+STREAMS = [0]
+SLOCK = threading.Lock()
+
+def session_only(fn):
+    @wraps(fn)
+    def w(*a, **kw):
+        if current_user() is None: return jsonify({"error": "Bạn chưa đăng nhập hoặc phiên đã hết hạn."}), 401
+        if g.get("via_token"): return jsonify({"error": "Thao tác này chỉ dùng được khi đăng nhập bằng trình duyệt."}), 403
+        return fn(*a, **kw)
+    return w
+
+@app.get("/api/tokens")
+@session_only
+def list_tokens():
+    rows = raw_all("SELECT id,name,prefix,created,last_used FROM api_tokens WHERE user_id=? ORDER BY id DESC", (current_user()["id"],))
+    return jsonify({"tokens": [dict(r) for r in rows]})
+
+@app.post("/api/tokens")
+@session_only
+def create_token():
+    u = current_user(); d = json_body()
+    name = str(d.get("name") or "Token").strip()[:40] or "Token"
+    if (raw_all("SELECT COUNT(*) AS n FROM api_tokens WHERE user_id=?", (u["id"],)) or [{"n": 0}])[0]["n"] >= 10:
+        return jsonify({"error": "Tối đa 10 token. Hãy xóa bớt token cũ."}), 400
+    tok = "ph_" + secrets.token_urlsafe(32)
+    raw_exec("INSERT INTO api_tokens(user_id,name,prefix,token_hash,created) VALUES(?,?,?,?,?)",
+             (u["id"], name, tok[:9], hashlib.sha256(tok.encode()).hexdigest(), time.time()))
+    return jsonify({"token": tok, "name": name, "note": "Token chỉ hiện một lần, hãy lưu lại ngay."}), 201
+
+@app.delete("/api/tokens/<int:tid>")
+@session_only
+def delete_token(tid):
+    raw_exec("DELETE FROM api_tokens WHERE id=? AND user_id=?", (tid, current_user()["id"]))
+    return jsonify({"ok": True})
+
+def cpu_percent(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f: x = f.read().rsplit(")", 1)[1].split()
+        ticks = (int(x[11]) + int(x[12])) / os.sysconf("SC_CLK_TCK"); threads = int(x[17])
+    except (OSError, ValueError, IndexError): return None, None
+    t = time.time(); prev = CPU_PREV.get(pid)
+    CPU_PREV[pid] = (t, ticks)
+    if not prev or t - prev[0] < 0.2:
+        time.sleep(0.25); t2 = time.time()
+        try:
+            with open(f"/proc/{pid}/stat") as f: y = f.read().rsplit(")", 1)[1].split()
+            t3 = (int(y[11]) + int(y[12])) / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError): return None, threads
+        CPU_PREV[pid] = (t2, t3)
+        return round(max(0, t3 - ticks) / max(0.01, t2 - t) * 100, 1), threads
+    return round(max(0, ticks - prev[1]) / (t - prev[0]) * 100, 1), threads
+
+def dir_bytes(path):
+    n = 0
+    for r, _, fs in os.walk(path):
+        for fn in fs:
+            try: n += os.path.getsize(os.path.join(r, fn))
+            except OSError: pass
+    return n
+
+@app.get("/api/projects/<pid>/stats")
+@login_required
+def project_stats(pid):
+    p = own_project(pid)
+    if not p: return not_found()
+    st = status_of(pid); out = {"status": st, "files_bytes": dir_bytes(wdir(pid)), "libs_bytes": dir_bytes(libdir(pid)),
+                                "restarts_10m": len([t for t in RESTARTS.get(pid, []) if time.time() - t < 600])}
+    if st.get("pid"):
+        cpu, th = cpu_percent(st["pid"]); out.update(cpu=cpu, threads=th, uptime=round(time.time() - st["started"]))
+    else: CPU_PREV.pop(pid, None)
+    return jsonify(out)
+
+def _sse(ev, data): return f"event: {ev}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+@app.get("/api/projects/<pid>/logs/stream")
+@login_required
+def log_stream(pid):
+    """Log trực tiếp (Server-Sent Events). Mỗi phiên tối đa 10 phút, trình duyệt tự nối lại."""
+    if not own_project(pid): return not_found()
+    with SLOCK:
+        if STREAMS[0] >= 4: return jsonify({"error": "Đang có quá nhiều luồng log mở cùng lúc."}), 429
+        STREAMS[0] += 1
+    path = logp(pid)
+    def gen():
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        try:
+            text, pos = read_tail(path, 30000)
+            yield _sse("init", {"text": text, "status": status_of(pid)})
+            end, last = time.time() + 600, 0
+            while time.time() < end:
+                try: size = os.path.getsize(path)
+                except OSError: size = 0
+                if size < pos: pos = 0; dec.reset(); yield _sse("reset", {})
+                if size > pos:
+                    with open(path, "rb") as f: f.seek(pos); data = f.read(65536)
+                    pos += len(data)
+                    yield _sse("log", {"text": dec.decode(data)})
+                    continue
+                if time.time() - last > 2: last = time.time(); yield _sse("status", status_of(pid))
+                time.sleep(0.5)
+            yield _sse("bye", {})
+        finally:
+            with SLOCK: STREAMS[0] -= 1
+    return Response(stream_with_context(gen()), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.get("/api/projects/<pid>/export")
+@login_required
+def export_project(pid):
+    p = own_project(pid)
+    if not p: return not_found()
+    base, buf, total = wdir(pid), io.BytesIO(), 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for r, _, fs in os.walk(base):
+            for fn in fs:
+                full = os.path.join(r, fn); total += os.path.getsize(full)
+                if total > 50 * MB: return jsonify({"error": "Dự án quá lớn để xuất (trên 50 MB)."}), 413
+                z.write(full, os.path.relpath(full, base))
+    buf.seek(0)
+    safe = re.sub(r"[^\w.-]+", "_", p["name"]).strip("_") or "project"
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=safe + ".zip")
+
+@app.post("/api/projects/<pid>/rename")
+@login_required
+def rename_file(pid):
+    p = own_project(pid)
+    if not p: return not_found()
+    d = json_body()
+    try:
+        src, old = safe_join(wdir(pid), d.get("path", ""))
+        dst, new = safe_join(wdir(pid), d.get("new", ""))
+    except ValueError as e: return jsonify({"error": str(e)}), 400
+    if not os.path.exists(src): return jsonify({"error": "Không có file này."}), 404
+    if old == new: return jsonify({"ok": True, "path": new})
+    if os.path.exists(dst): return jsonify({"error": "Đã có file trùng tên này."}), 409
+    if os.path.isfile(src) and old.lower().endswith(".py") and not new.lower().endswith(".py") and (p["entry"] or "") == old:
+        return jsonify({"error": "Đây là file chạy chính, tên mới phải có đuôi .py."}), 400
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.rename(src, dst)
+    if (p["entry"] or "") == old: ex("UPDATE projects SET entry=? WHERE id=?", (new, pid))
+    return jsonify({"ok": True, "path": new})
 
 @app.get("/api/projects/<pid>/download")
 @login_required

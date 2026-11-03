@@ -27,3 +27,12 @@ Chương trình người dùng chạy **trên cùng máy chủ**, không phải 
 
 ## Chọn phiên bản Python (3.9 / 3.10 / 3.11 / 3.12 / 3.13)
 Vào dự án → Cài đặt → "Phiên bản Python". Máy chủ dùng sẵn `python3.x` nếu có, nếu chưa có thì tự tải bằng `uv` (cần mạng, lần đầu 10–60 giây, lưu vào thư mục `pythons/` cạnh database). Mỗi dự án chọn riêng. Đổi phiên bản xong hãy cài lại `requirements.txt`.
+
+## Tự cài thư viện
+Khi bấm ▶ Chạy mà dự án có `requirements.txt` mới hoặc vừa đổi, máy chủ tự chạy `pip install` trước rồi mới chạy chương trình (xem tiến trình ở tab Log). Cài lỗi thì không chạy và báo trong log. Giờ trong log theo múi giờ `TZ` (mặc định Asia/Ho_Chi_Minh).
+
+## API nâng cao
+- **API token:** menu avatar → "API token". Gọi API không cần đăng nhập: `curl -H "Authorization: Bearer ph_xxx" https://<host>/api/projects`. Token chỉ hiện một lần, thu hồi bất cứ lúc nào. Token không tạo/xóa được token khác.
+- **Log trực tiếp:** `GET /api/projects/<id>/logs/stream` (Server-Sent Events: init, log, status, reset). Tối đa 4 luồng cùng lúc.
+- **Thống kê:** `GET /api/projects/<id>/stats` → CPU %, RAM, số luồng, uptime, dung lượng, số lần tự chạy lại.
+- **Xuất dự án:** `GET /api/projects/<id>/export` → file .zip. Đổi tên file: `POST /api/projects/<id>/rename` `{"path","new"}`.
